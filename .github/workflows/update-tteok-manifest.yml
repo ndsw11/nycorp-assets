@@ -1,0 +1,83 @@
+name: Update tteok image manifest
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "tteok/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-tteok-image-manifest
+  cancel-in-progress: true
+
+jobs:
+  update-manifest:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build image manifest
+        env:
+          MANIFEST_VERSION: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          extensions = {'.avif', '.gif', '.jpeg', '.jpg', '.png', '.webp'}
+          tracked_paths = subprocess.check_output(
+              ['git', 'ls-files', '-z', 'tteok'],
+              text=True,
+          ).split('\0')
+
+          images = []
+          for tracked_path in tracked_paths:
+              if not tracked_path:
+                  continue
+              path = Path(tracked_path)
+              if path.name == 'manifest.json' or path.suffix.lower() not in extensions:
+                  continue
+
+              number_match = re.match(r'^(\d+)', path.name)
+              images.append({
+                  'name': path.name,
+                  'order': int(number_match.group(1)) if number_match else None,
+              })
+
+          images.sort(key=lambda image: (
+              image['order'] is None,
+              image['order'] if image['order'] is not None else 0,
+          ))
+
+          manifest = {
+              'version': os.environ['MANIFEST_VERSION'],
+              'generatedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'images': images,
+          }
+          Path('tteok/manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Commit updated manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tteok/manifest.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: update tteok image manifest"
+          git push
