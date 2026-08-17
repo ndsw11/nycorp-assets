@@ -1,0 +1,126 @@
+name: 이미지 압축 (WebP 변환)
+
+# 실행 방법: GitHub 저장소 → Actions 탭 → 왼쪽 "이미지 압축 (WebP 변환)" → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      max_width:
+        description: '최대 가로 폭(px) — 이보다 넓은 이미지만 축소됩니다'
+        required: true
+        default: '1600'
+      quality:
+        description: '품질 (1~100, 82 권장)'
+        required: true
+        default: '82'
+      dry_run:
+        description: '미리보기만 (true = 실제로 커밋하지 않고 결과만 확인)'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 변환 도구 설치
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick webp
+
+      - name: 압축 실행
+        id: run
+        env:
+          MAXW: ${{ github.event.inputs.max_width }}
+          Q: ${{ github.event.inputs.quality }}
+        run: |
+          set -uo pipefail
+
+          before_total=0
+          after_total=0
+          converted=0
+          kept=0
+
+          echo "## 압축 결과" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 파일 | 전 | 후 | 절감 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r -d '' f; do
+            ext="${f##*.}"
+            ext_lc="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+            out="${f%.*}.webp"
+
+            before=$(stat -c%s "$f")
+            tmp="$(mktemp --suffix=.webp)"
+
+            if ! convert "$f" -auto-orient -strip \
+                  -resize "${MAXW}x${MAXW}>" \
+                  -quality "$Q" -define webp:method=6 "$tmp" 2>/dev/null; then
+              echo "  변환 실패, 건너뜀: $f"
+              rm -f "$tmp"
+              before_total=$((before_total + before)); after_total=$((after_total + before))
+              continue
+            fi
+
+            after=$(stat -c%s "$tmp")
+
+            # 이미 WebP인데 더 작아지지 않으면 원본 유지
+            if [ "$ext_lc" = "webp" ] && [ "$after" -ge "$before" ]; then
+              rm -f "$tmp"
+              kept=$((kept + 1))
+              before_total=$((before_total + before)); after_total=$((after_total + before))
+              echo "  유지: $f ($((before/1024))KB)"
+              continue
+            fi
+
+            mv "$tmp" "$out"
+            # PNG/JPG였다면 원본 삭제 (git 이력에는 그대로 남으므로 언제든 복구 가능)
+            if [ "$out" != "$f" ]; then rm -f "$f"; fi
+
+            pct=$(( 100 - (after * 100 / before) ))
+            printf '| `%s` | %s KB | %s KB | -%s%% |\n' \
+              "$f" "$((before/1024))" "$((after/1024))" "$pct" >> "$GITHUB_STEP_SUMMARY"
+            echo "  $f : $((before/1024))KB -> $((after/1024))KB (-${pct}%)"
+
+            converted=$((converted + 1))
+            before_total=$((before_total + before)); after_total=$((after_total + after))
+          done < <(find . -path ./.git -prune -o -path ./.github -prune -o -type f \
+                     \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) -print0)
+
+          bt=$((before_total / 1048576)); at=$((after_total / 1048576))
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**합계: ${bt} MB → ${at} MB** (변환 ${converted}개 / 유지 ${kept}개)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$at" -lt 50 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "jsDelivr 50MB 제한 통과 ✅" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "아직 50MB 초과 ❌ — 품질을 75로 낮추거나 최대 폭을 1280으로 줄여 다시 실행하세요." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 변경사항 커밋
+        if: ${{ github.event.inputs.dry_run == 'false' }}
+        run: |
+          git config user.name  "image-optimizer[bot]"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "변경사항 없음"
+          else
+            git commit -m "chore: 이미지 WebP 변환 및 압축 (폭 ${{ github.event.inputs.max_width }}px / 품질 ${{ github.event.inputs.quality }})"
+            git push
+          fi
+
+      - name: jsDelivr 캐시 비우기
+        if: ${{ github.event.inputs.dry_run == 'false' }}
+        continue-on-error: true
+        run: |
+          curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/" > /dev/null || true
+          echo "jsDelivr 캐시 갱신 요청을 보냈습니다. 반영까지 몇 분 걸릴 수 있습니다."
